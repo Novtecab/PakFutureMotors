@@ -1,0 +1,458 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// User model with multi-auth support
+model User {
+  id             String   @id @default(cuid())
+  email          String   @unique
+  phone          String?  @unique
+  passwordHash   String?  @map("password_hash") // nullable for social auth
+  firstName      String   @map("first_name")
+  lastName       String   @map("last_name")
+  avatarUrl      String?  @map("avatar_url")
+  
+  // Authentication metadata
+  emailVerified  Boolean  @default(false) @map("email_verified")
+  phoneVerified  Boolean  @default(false) @map("phone_verified")
+  authProviders  String[] @map("auth_providers") // ["email", "google", "facebook", "phone"]
+  
+  // Account management
+  createdAt      DateTime @default(now()) @map("created_at")
+  updatedAt      DateTime @updatedAt @map("updated_at")
+  lastLogin      DateTime? @map("last_login")
+  status         UserStatus @default(ACTIVE)
+  
+  // Preferences
+  newsletterSubscribed Boolean @default(false) @map("newsletter_subscribed")
+  preferredLanguage   String  @default("en") @map("preferred_language")
+  
+  // Relationships
+  addresses      Address[]
+  orders         Order[]
+  bookings       Booking[]
+  carts          Cart[]
+  
+  @@map("users")
+}
+
+model Address {
+  id            String      @id @default(cuid())
+  userId        String      @map("user_id")
+  type          AddressType
+  streetAddress String      @map("street_address")
+  city          String
+  state         String
+  postalCode    String      @map("postal_code")
+  country       String
+  isDefault     Boolean     @default(false) @map("is_default")
+  
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@map("addresses")
+}
+
+// Product model for cars and accessories
+model Product {
+  id                String           @id @default(cuid())
+  sku               String           @unique
+  name              String
+  description       String           @db.Text
+  category          ProductCategory
+  subcategory       String?
+  
+  // Pricing
+  price             Decimal          @db.Decimal(10, 2)
+  currency          String           @default("USD")
+  salePrice         Decimal?         @db.Decimal(10, 2) @map("sale_price")
+  
+  // Inventory
+  stockQuantity     Int              @map("stock_quantity")
+  lowStockThreshold Int              @map("low_stock_threshold")
+  trackInventory    Boolean          @default(true) @map("track_inventory")
+  
+  // Media and content
+  images            ProductImage[]
+  documents         ProductDocument[]
+  
+  // Metadata
+  brand             String
+  model             String?
+  year              Int?
+  specifications    Json? // Flexible JSON field for car specs
+  
+  // SEO and discovery
+  slug              String           @unique
+  tags              String[]
+  searchKeywords    String[]         @map("search_keywords")
+  
+  // Management
+  status            ProductStatus    @default(ACTIVE)
+  featured          Boolean          @default(false)
+  createdAt         DateTime         @default(now()) @map("created_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
+  
+  // Relationships
+  orderItems        OrderItem[]
+  cartItems         CartItem[]
+  
+  @@index([category, status])
+  @@index([featured, status])
+  @@map("products")
+}
+
+model ProductImage {
+  id        String  @id @default(cuid())
+  productId String  @map("product_id")
+  url       String
+  altText   String  @map("alt_text")
+  sortOrder Int     @map("sort_order")
+  isPrimary Boolean @default(false) @map("is_primary")
+  
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  
+  @@map("product_images")
+}
+
+model ProductDocument {
+  id        String  @id @default(cuid())
+  productId String  @map("product_id")
+  name      String
+  url       String
+  type      String // "manual", "specification", "warranty", etc.
+  
+  product   Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  
+  @@map("product_documents")
+}
+
+// Service model for bookable services
+model Service {
+  id                    String        @id @default(cuid())
+  name                  String
+  description           String        @db.Text
+  category              ServiceCategory
+  
+  // Pricing structure (base + add-ons)
+  basePrice             Decimal       @db.Decimal(10, 2) @map("base_price")
+  currency              String        @default("USD")
+  
+  // Scheduling
+  durationHours         Int           @default(1) @map("duration_hours")
+  advanceBookingDays    Int           @map("advance_booking_days")
+  maxAdvanceBookingDays Int           @map("max_advance_booking_days")
+  
+  // Availability
+  availableDays         Int[]         @map("available_days") // [0,1,2,3,4,5,6] for Sun-Sat
+  availableHours        Json          @map("available_hours") // [{start_hour: 9, end_hour: 17}]
+  maxDailyBookings      Int           @map("max_daily_bookings")
+  
+  // Additional info
+  preparationInstructions String?     @db.Text @map("preparation_instructions")
+  requirements          String?       @db.Text
+  
+  // Management
+  status                ServiceStatus @default(ACTIVE)
+  featured              Boolean       @default(false)
+  createdAt             DateTime      @default(now()) @map("created_at")
+  updatedAt             DateTime      @updatedAt @map("updated_at")
+  
+  // Relationships
+  addOns                ServiceAddOn[]
+  bookings              Booking[]
+  
+  @@index([category, status])
+  @@map("services")
+}
+
+model ServiceAddOn {
+  id          String  @id @default(cuid())
+  serviceId   String  @map("service_id")
+  name        String
+  description String
+  price       Decimal @db.Decimal(10, 2)
+  required    Boolean @default(false)
+  
+  service     Service @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  
+  @@map("service_add_ons")
+}
+
+// Order model for product purchases
+model Order {
+  id             String      @id @default(cuid())
+  orderNumber    String      @unique @map("order_number")
+  userId         String      @map("user_id")
+  
+  // Order details
+  subtotal       Decimal     @db.Decimal(10, 2)
+  taxAmount      Decimal     @db.Decimal(10, 2) @map("tax_amount")
+  shippingAmount Decimal     @db.Decimal(10, 2) @map("shipping_amount")
+  discountAmount Decimal     @default(0) @db.Decimal(10, 2) @map("discount_amount")
+  totalAmount    Decimal     @db.Decimal(10, 2) @map("total_amount")
+  currency       String      @default("USD")
+  
+  // Fulfillment
+  status         OrderStatus @default(PENDING)
+  shippingAddress Json       @map("shipping_address")
+  billingAddress Json       @map("billing_address")
+  shippingMethod String     @map("shipping_method")
+  trackingNumber String?    @map("tracking_number")
+  
+  // Timestamps
+  createdAt      DateTime    @default(now()) @map("created_at")
+  updatedAt      DateTime    @updatedAt @map("updated_at")
+  shippedAt      DateTime?   @map("shipped_at")
+  deliveredAt    DateTime?   @map("delivered_at")
+  
+  // Notes
+  notes          String?     @db.Text
+  
+  // Relationships
+  user           User        @relation(fields: [userId], references: [id])
+  items          OrderItem[]
+  payment        Payment?
+  
+  @@index([userId, createdAt])
+  @@index([status, createdAt])
+  @@map("orders")
+}
+
+model OrderItem {
+  id          String  @id @default(cuid())
+  orderId     String  @map("order_id")
+  productId   String  @map("product_id")
+  quantity    Int
+  unitPrice   Decimal @db.Decimal(10, 2) @map("unit_price")
+  totalPrice  Decimal @db.Decimal(10, 2) @map("total_price")
+  
+  // Snapshot data
+  productName String  @map("product_name")
+  productSku  String  @map("product_sku")
+  
+  order       Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product     Product @relation(fields: [productId], references: [id])
+  
+  @@map("order_items")
+}
+
+// Booking model for service appointments
+model Booking {
+  id            String        @id @default(cuid())
+  bookingNumber String        @unique @map("booking_number")
+  userId        String        @map("user_id")
+  serviceId     String        @map("service_id")
+  
+  // Appointment details
+  scheduledDate DateTime      @map("scheduled_date") @db.Date
+  scheduledHour Int           @map("scheduled_hour") // 0-23
+  durationHours Int           @map("duration_hours")
+  
+  // Pricing
+  basePrice     Decimal       @db.Decimal(10, 2) @map("base_price")
+  addOnsTotal   Decimal       @default(0) @db.Decimal(10, 2) @map("add_ons_total")
+  totalAmount   Decimal       @db.Decimal(10, 2) @map("total_amount")
+  currency      String        @default("USD")
+  
+  // Customer information
+  vehicleMake   String?       @map("vehicle_make")
+  vehicleModel  String?       @map("vehicle_model")
+  vehicleYear   Int?          @map("vehicle_year")
+  specialInstructions String? @db.Text @map("special_instructions")
+  
+  // Status tracking
+  status        BookingStatus @default(PENDING)
+  createdAt     DateTime      @default(now()) @map("created_at")
+  updatedAt     DateTime      @updatedAt @map("updated_at")
+  confirmedAt   DateTime?     @map("confirmed_at")
+  completedAt   DateTime?     @map("completed_at")
+  
+  // Notes
+  notes         String?       @db.Text
+  
+  // Relationships
+  user          User          @relation(fields: [userId], references: [id])
+  service       Service       @relation(fields: [serviceId], references: [id])
+  selectedAddOns BookingAddOn[]
+  payment       Payment?
+  
+  @@unique([serviceId, scheduledDate, scheduledHour])
+  @@index([userId, scheduledDate])
+  @@index([serviceId, scheduledDate])
+  @@map("bookings")
+}
+
+model BookingAddOn {
+  id        String  @id @default(cuid())
+  bookingId String  @map("booking_id")
+  addOnId   String  @map("add_on_id")
+  name      String  // snapshot
+  price     Decimal @db.Decimal(10, 2) // snapshot
+  
+  booking   Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  
+  @@map("booking_add_ons")
+}
+
+// Payment model for transaction processing
+model Payment {
+  id                    String        @id @default(cuid())
+  
+  // Association (either order OR booking)
+  orderId               String?       @unique @map("order_id")
+  bookingId             String?       @unique @map("booking_id")
+  
+  // Payment details
+  amount                Decimal       @db.Decimal(10, 2)
+  currency              String        @default("USD")
+  paymentMethod         PaymentMethod @map("payment_method")
+  
+  // Provider data
+  provider              PaymentProvider
+  providerTransactionId String?       @map("provider_transaction_id")
+  providerFee           Decimal?      @db.Decimal(10, 2) @map("provider_fee")
+  
+  // Status tracking
+  status                PaymentStatus @default(PENDING)
+  createdAt             DateTime      @default(now()) @map("created_at")
+  processedAt           DateTime?     @map("processed_at")
+  failedAt              DateTime?     @map("failed_at")
+  refundedAt            DateTime?     @map("refunded_at")
+  
+  // Failure handling
+  failureReason         String?       @map("failure_reason")
+  retryCount            Int           @default(0) @map("retry_count")
+  
+  // Customer data
+  billingAddress        Json          @map("billing_address")
+  paymentMetadata       Json?         @map("payment_metadata")
+  
+  // Relationships
+  order                 Order?        @relation(fields: [orderId], references: [id])
+  booking               Booking?      @relation(fields: [bookingId], references: [id])
+  
+  @@index([provider, providerTransactionId])
+  @@index([status, createdAt])
+  @@map("payments")
+}
+
+// Cart model for shopping cart
+model Cart {
+  id        String     @id @default(cuid())
+  userId    String?    @map("user_id")
+  sessionId String?    @map("session_id")
+  
+  subtotal  Decimal    @default(0) @db.Decimal(10, 2)
+  expiresAt DateTime   @map("expires_at")
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+  
+  // Relationships
+  user      User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items     CartItem[]
+  
+  @@map("carts")
+}
+
+model CartItem {
+  id        String   @id @default(cuid())
+  cartId    String   @map("cart_id")
+  productId String   @map("product_id")
+  quantity  Int
+  addedAt   DateTime @default(now()) @map("added_at")
+  
+  cart      Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id])
+  
+  @@unique([cartId, productId])
+  @@map("cart_items")
+}
+
+// Enums
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum AddressType {
+  BILLING
+  SHIPPING
+}
+
+enum ProductCategory {
+  CARS
+  ACCESSORIES
+  PARTS
+  TOOLS
+}
+
+enum ProductStatus {
+  ACTIVE
+  INACTIVE
+  DISCONTINUED
+}
+
+enum ServiceCategory {
+  DETAILING
+  COATING
+  MAINTENANCE
+  REPAIR
+  INSPECTION
+}
+
+enum ServiceStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum BookingStatus {
+  PENDING
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+enum PaymentMethod {
+  CREDIT_CARD
+  DEBIT_CARD
+  PAYPAL
+  APPLE_PAY
+  GOOGLE_PAY
+  BANK_TRANSFER
+}
+
+enum PaymentProvider {
+  STRIPE
+  PAYPAL
+  MANUAL
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  CANCELLED
+  REFUNDED
+}
