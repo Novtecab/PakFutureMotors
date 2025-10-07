@@ -138,7 +138,7 @@ export class OrderModel {
       );
 
       // Generate order number
-      const orderNumber = await this.generateOrderNumber();
+      const orderNumber = await OrderModel.generateOrderNumber();
 
       // Create order
       const order = await tx.order.create({
@@ -627,7 +627,7 @@ export class OrderModel {
   }
 
   // Helper methods
-  private static calculateOrderTotals(
+  static calculateOrderTotals(
     items: any[],
     shippingMethod: string,
     shippingAddress: any
@@ -657,7 +657,7 @@ export class OrderModel {
     };
   }
 
-  private static getTaxRate(state: string): number {
+  static getTaxRate(state: string): number {
     // Mock tax rates by state
     const taxRates: Record<string, number> = {
       'CA': 0.08,
@@ -668,7 +668,7 @@ export class OrderModel {
     return taxRates[state] || 0.05;
   }
 
-  private static calculateShipping(items: any[], method: string): number {
+  static calculateShipping(items: any[], method: string): number {
     const baseRates = {
       standard: 10,
       express: 25,
@@ -687,7 +687,7 @@ export class OrderModel {
     return baseRates[method as keyof typeof baseRates] || 10;
   }
 
-  private static async generateOrderNumber(): Promise<string> {
+  static async generateOrderNumber(): Promise<string> {
     const now = new Date();
     const year = now.getFullYear();
     const month = String(now.getMonth() + 1).padStart(2, '0');
