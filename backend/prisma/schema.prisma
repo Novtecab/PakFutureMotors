@@ -168,6 +168,7 @@ model Service {
   // Relationships
   addOns                ServiceAddOn[]
   bookings              Booking[]
+  cartItems             CartItem[] // Add this line
   
   @@index([category, status])
   @@map("services")
@@ -365,14 +366,17 @@ model Cart {
 model CartItem {
   id        String   @id @default(cuid())
   cartId    String   @map("cart_id")
-  productId String   @map("product_id")
+  productId String?  @map("product_id") // Make nullable to allow services
+  serviceId String?  @map("service_id") // New field for service
   quantity  Int
   addedAt   DateTime @default(now()) @map("added_at")
   
   cart      Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
-  product   Product  @relation(fields: [productId], references: [id])
+  product   Product? @relation(fields: [productId], references: [id]) // Make nullable
+  service   Service? @relation(fields: [serviceId], references: [id]) // New relation to Service
   
-  @@unique([cartId, productId])
+  @@unique([cartId, productId]) // Keep for products
+  @@unique([cartId, serviceId]) // New unique constraint for services
   @@map("cart_items")
 }
 

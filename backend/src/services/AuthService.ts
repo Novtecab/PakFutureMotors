@@ -13,8 +13,24 @@ export interface JwtPayload {
 
 // Zod schema for login input
 export const LoginSchema = z.object({
-  credential: z.string().min(1, "Email or phone is required"),
-  password: z.string().min(1, "Password is required"),
+  credential: z.string().optional(), // Email or phone
+  password: z.string().optional(),
+  authProvider: z.enum(['email', 'google', 'facebook', 'phone']),
+  socialToken: z.string().optional(), // For social logins
+  verificationCode: z.string().optional(), // For phone/OTP
+}).refine((data) => {
+  if (data.authProvider === 'email') {
+    return data.credential && data.password;
+  }
+  if (data.authProvider === 'phone') {
+    return data.credential && data.verificationCode;
+  }
+  if (['google', 'facebook'].includes(data.authProvider)) {
+    return data.socialToken;
+  }
+  return false;
+}, {
+  message: "Invalid login credentials for the specified auth provider",
 });
 
 export type LoginInput = z.infer<typeof LoginSchema>;
@@ -43,24 +59,86 @@ export class AuthService {
    */
   static async login(input: LoginInput): Promise<{ user: User; accessToken: string; refreshToken: string }> {
     const validatedInput = LoginSchema.parse(input);
+    let user: User | null = null;
 
-    const user = await UserModel.findByCredential(validatedInput.credential);
+    switch (validatedInput.authProvider) {
+      case 'email':
+        if (!validatedInput.credential || !validatedInput.password) {
+          throw new Error('EMAIL_AND_PASSWORD_REQUIRED');
+        }
+        user = await UserModel.findByCredential(validatedInput.credential);
+        if (!user || user.status !== UserStatus.ACTIVE) {
+          throw new Error('INVALID_CREDENTIALS');
+        }
+        if (!user.passwordHash || !(await UserModel.verifyPassword(user, validatedInput.password))) {
+          throw new Error('INVALID_CREDENTIALS');
+        }
+        break;
 
-    if (!user || user.status !== UserStatus.ACTIVE) {
-      throw new Error('INVALID_CREDENTIALS');
+      case 'phone':
+        if (!validatedInput.credential || !validatedInput.verificationCode) {
+          throw new Error('PHONE_AND_VERIFICATION_CODE_REQUIRED');
+        }
+        const isPhoneVerified = await AuthHelper.validatePhoneCode(validatedInput.credential, validatedInput.verificationCode);
+        if (!isPhoneVerified) {
+          throw new Error('INVALID_VERIFICATION_CODE');
+        }
+        user = await UserModel.findByCredential(validatedInput.credential);
+        if (!user || user.status !== UserStatus.ACTIVE) {
+          throw new Error('USER_NOT_FOUND_OR_INACTIVE');
+        }
+        // Ensure phone is marked as verified in DB if not already
+        if (!user.phoneVerified) {
+          await prisma.user.update({
+            where: { id: user.id },
+            data: { phoneVerified: true },
+          });
+          user.phoneVerified = true; // Update in memory object
+        }
+        break;
+
+      case 'google':
+      case 'facebook':
+        if (!validatedInput.socialToken) {
+          throw new Error('SOCIAL_TOKEN_REQUIRED');
+        }
+        const socialProfile = await AuthHelper.validateSocialToken(validatedInput.authProvider, validatedInput.socialToken);
+        if (!socialProfile.email) {
+          throw new Error('SOCIAL_LOGIN_EMAIL_MISSING');
+        }
+        user = await UserModel.findByCredential(socialProfile.email);
+
+        if (!user) {
+          // Register new user if not found
+          user = await UserModel.create({
+            email: socialProfile.email,
+            firstName: socialProfile.firstName,
+            lastName: socialProfile.lastName,
+            avatarUrl: socialProfile.avatarUrl,
+            authProvider: validatedInput.authProvider,
+          });
+          // For social logins, email is considered verified upon successful token validation
+          await prisma.user.update({
+            where: { id: user.id },
+            data: { emailVerified: true },
+          });
+          user.emailVerified = true; // Update the in-memory user object
+        } else if (user.status !== UserStatus.ACTIVE) {
+          throw new Error('USER_ACCOUNT_INACTIVE');
+        } else {
+          // Ensure social provider is added if not already
+          if (!user.authProviders.includes(validatedInput.authProvider)) {
+            user = await UserModel.addAuthProvider(user.id, validatedInput.authProvider);
+          }
+        }
+        break;
+
+      default:
+        throw new Error('UNSUPPORTED_AUTH_PROVIDER');
     }
 
-    // For email/password authentication
-    if (user.passwordHash) {
-      const isPasswordValid = await UserModel.verifyPassword(user, validatedInput.password);
-      if (!isPasswordValid) {
-        throw new Error('INVALID_CREDENTIALS');
-      }
-    } else {
-      // Handle social login or phone/OTP where passwordHash might be null
-      // For simplicity, assuming if passwordHash is null, it's a social/OTP user
-      // A real implementation would require specific social token validation or OTP verification here
-      throw new Error('PASSWORD_REQUIRED_FOR_THIS_ACCOUNT');
+    if (!user) {
+      throw new Error('LOGIN_FAILED');
     }
 
     await UserModel.updateLastLogin(user.id);

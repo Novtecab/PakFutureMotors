@@ -2,16 +2,22 @@
  * T025: Cart model and session management
  * Cart entity with Redis integration, expiration, guest support
  */
-import { PrismaClient, Cart, CartItem, Product } from '@prisma/client';
+import { PrismaClient, Cart, CartItem, Product, Service, ProductImage } from '@prisma/client'; // Import Service, ProductImage
 import { z } from 'zod';
-import ProductModel from './Product';
+import ProductModel, { ProductWithMedia } from './Product';
+import ServiceModel from './Service';
 
 const prisma = new PrismaClient();
 
 // Validation schemas
 export const AddToCartSchema = z.object({
-  productId: z.string().cuid(),
+  productId: z.string().cuid().optional(),
+  serviceId: z.string().cuid().optional(),
   quantity: z.number().int().min(1).max(100),
+}).refine(data => data.productId || data.serviceId, {
+  message: "Either productId or serviceId must be provided.",
+}).refine(data => !(data.productId && data.serviceId), {
+  message: "Cannot provide both productId and serviceId.",
 });
 
 export const UpdateCartItemSchema = z.object({
@@ -29,7 +35,10 @@ export type MergeCartData = z.infer<typeof MergeCartSchema>;
 // Cart with items and products
 export type CartWithItems = Cart & {
   items: (CartItem & {
-    product: Product;
+    product: (Product & {
+      images: ProductImage[];
+    }) | null;
+    service: Service | null;
   })[];
 };
 
@@ -56,19 +65,23 @@ export class CartModel {
       include: {
         items: {
           include: {
-            product: {
+            items: {
               include: {
-                images: {
-                  where: { isPrimary: true },
-                  take: 1,
+                product: {
+                  include: {
+                    images: {
+                      where: { isPrimary: true },
+                      take: 1,
+                    },
+                  },
                 },
+                service: true,
               },
+              orderBy: { addedAt: 'desc' },
             },
           },
-          orderBy: { addedAt: 'desc' },
         },
-      },
-    });
+      });
 
     // Create new cart if none exists
     if (!existingCart) {
@@ -81,18 +94,23 @@ export class CartModel {
         include: {
           items: {
             include: {
-              product: {
+              items: {
                 include: {
-                  images: {
-                    where: { isPrimary: true },
-                    take: 1,
+                  product: {
+                    include: {
+                      images: {
+                        where: { isPrimary: true },
+                        take: 1,
+                      },
+                    },
                   },
+                  service: true,
                 },
+                orderBy: { addedAt: 'desc' },
               },
             },
           },
-        },
-      });
+        });
     }
 
     // Update cart with calculated totals
@@ -108,71 +126,78 @@ export class CartModel {
   ): Promise<CartWithItems> {
     const validatedData = AddToCartSchema.parse(data);
 
-    // Verify product exists and check stock
-    const product = await ProductModel.findById(validatedData.productId);
-    if (!product) {
-      throw new Error('PRODUCT_NOT_FOUND');
-    }
-
-    if (product.status !== 'ACTIVE') {
-      throw new Error('PRODUCT_NOT_AVAILABLE');
-    }
-
-    // Check stock availability
-    const isInStock = await ProductModel.checkStock(
-      validatedData.productId,
-      validatedData.quantity
-    );
-    if (!isInStock) {
-      throw new Error('INSUFFICIENT_STOCK');
-    }
-
     return await prisma.$transaction(async (tx) => {
-      // Check if item already exists in cart
-      const existingItem = await tx.cartItem.findUnique({
-        where: {
-          cartId_productId: {
+      let existingItem;
+      let itemPrice: number;
+      let itemName: string;
+
+      if (validatedData.productId) {
+        const product = await ProductModel.findById(validatedData.productId);
+        if (!product || product.status !== 'ACTIVE') {
+          throw new Error('PRODUCT_NOT_AVAILABLE');
+        }
+        const isInStock = await ProductModel.checkStock(validatedData.productId, validatedData.quantity);
+        if (!isInStock) {
+          throw new Error('INSUFFICIENT_STOCK');
+        }
+        itemPrice = Number(product.price);
+        itemName = product.name;
+
+        existingItem = await tx.cartItem.findFirst({
+          where: {
             cartId,
             productId: validatedData.productId,
           },
-        },
-      });
+        });
+      } else if (validatedData.serviceId) {
+        const service = await ServiceModel.findById(validatedData.serviceId);
+        if (!service || service.status !== 'ACTIVE') {
+          throw new Error('SERVICE_NOT_AVAILABLE');
+        }
+        itemPrice = Number(service.basePrice);
+        itemName = service.name;
+
+        existingItem = await tx.cartItem.findFirst({
+          where: {
+            cartId,
+            serviceId: validatedData.serviceId,
+          },
+        });
+      } else {
+        throw new Error('INVALID_ITEM_TYPE');
+      }
 
       if (existingItem) {
-        // Update quantity
         const newQuantity = existingItem.quantity + validatedData.quantity;
-        
-        // Check stock for new quantity
-        const hasStock = await ProductModel.checkStock(
-          validatedData.productId,
-          newQuantity
-        );
-        if (!hasStock) {
-          throw new Error('INSUFFICIENT_STOCK');
+        if (validatedData.productId) {
+          const hasStock = await ProductModel.checkStock(validatedData.productId, newQuantity);
+          if (!hasStock) {
+            throw new Error('INSUFFICIENT_STOCK');
+          }
         }
+        // No explicit stock check for services here, as it's handled at booking time.
+        // This might need refinement based on how service "inventory" is managed.
 
         await tx.cartItem.update({
           where: { id: existingItem.id },
           data: { quantity: newQuantity },
         });
       } else {
-        // Create new cart item
         await tx.cartItem.create({
           data: {
             cartId,
             productId: validatedData.productId,
+            serviceId: validatedData.serviceId,
             quantity: validatedData.quantity,
           },
         });
       }
 
-      // Update cart expiration
       await tx.cart.update({
         where: { id: cartId },
         data: { expiresAt: this.calculateExpirationDate() },
       });
 
-      // Return updated cart
       const updatedCart = await tx.cart.findUnique({
         where: { id: cartId },
         include: {
@@ -186,6 +211,7 @@ export class CartModel {
                   },
                 },
               },
+              service: true,
             },
             orderBy: { addedAt: 'desc' },
           },
@@ -208,7 +234,18 @@ export class CartModel {
     return await prisma.$transaction(async (tx) => {
       const cartItem = await tx.cartItem.findUnique({
         where: { id: itemId },
-        include: { cart: true },
+        include: {
+          cart: true,
+          product: {
+            include: {
+              images: {
+                where: { isPrimary: true },
+                take: 1,
+              },
+            },
+          },
+          service: true,
+        },
       });
 
       if (!cartItem) {
@@ -221,14 +258,17 @@ export class CartModel {
           where: { id: itemId },
         });
       } else {
-        // Check stock for new quantity
-        const hasStock = await ProductModel.checkStock(
-          cartItem.productId,
-          validatedData.quantity
-        );
-        if (!hasStock) {
-          throw new Error('INSUFFICIENT_STOCK');
+        // Check stock for new quantity if it's a product
+        if (cartItem.productId) {
+          const hasStock = await ProductModel.checkStock(
+            cartItem.productId,
+            validatedData.quantity
+          );
+          if (!hasStock) {
+            throw new Error('INSUFFICIENT_STOCK');
+          }
         }
+        // No explicit stock check for services here, as it's handled at booking time.
 
         // Update quantity
         await tx.cartItem.update({
@@ -257,6 +297,7 @@ export class CartModel {
                   },
                 },
               },
+              service: true,
             },
             orderBy: { addedAt: 'desc' },
           },
@@ -307,7 +348,19 @@ export class CartModel {
       const guestCart = await tx.cart.findUnique({
         where: { id: validatedData.guestCartId },
         include: {
-          items: true,
+          items: {
+            include: {
+              product: {
+                include: {
+                  images: {
+                    where: { isPrimary: true },
+                    take: 1,
+                  },
+                },
+              },
+              service: true,
+            },
+          },
         },
       });
 
@@ -319,7 +372,19 @@ export class CartModel {
       const userCart = await tx.cart.findUnique({
         where: { id: userCartId },
         include: {
-          items: true,
+          items: {
+            include: {
+              product: {
+                include: {
+                  images: {
+                    where: { isPrimary: true },
+                    take: 1,
+                  },
+                },
+              },
+              service: true,
+            },
+          },
         },
       });
 
@@ -329,38 +394,38 @@ export class CartModel {
 
       // Merge items
       for (const guestItem of guestCart.items) {
-        const existingUserItem = userCart.items.find(
-          item => item.productId === guestItem.productId
+        const existingUserItem = userCart.items.find(item =>
+          (item.productId && guestItem.productId && item.productId === guestItem.productId) ||
+          (item.serviceId && guestItem.serviceId && item.serviceId === guestItem.serviceId)
         );
 
         if (existingUserItem) {
-          // Combine quantities
           const newQuantity = existingUserItem.quantity + guestItem.quantity;
-          
-          // Check stock
-          const hasStock = await ProductModel.checkStock(
-            guestItem.productId,
-            newQuantity
-          );
-          
-          if (hasStock) {
+          let canAdd = true;
+          if (guestItem.productId) {
+            canAdd = await ProductModel.checkStock(guestItem.productId, newQuantity);
+          }
+          // No explicit service availability check during merge, assume it's handled at booking.
+
+          if (canAdd) {
             await tx.cartItem.update({
               where: { id: existingUserItem.id },
               data: { quantity: newQuantity },
             });
           }
         } else {
-          // Add new item to user cart
-          const hasStock = await ProductModel.checkStock(
-            guestItem.productId,
-            guestItem.quantity
-          );
-          
-          if (hasStock) {
+          let canAdd = true;
+          if (guestItem.productId) {
+            canAdd = await ProductModel.checkStock(guestItem.productId, guestItem.quantity);
+          }
+          // No explicit service availability check during merge.
+
+          if (canAdd) {
             await tx.cartItem.create({
               data: {
                 cartId: userCartId,
                 productId: guestItem.productId,
+                serviceId: guestItem.serviceId,
                 quantity: guestItem.quantity,
               },
             });
@@ -396,6 +461,7 @@ export class CartModel {
                   },
                 },
               },
+              service: true,
             },
             orderBy: { addedAt: 'desc' },
           },
@@ -415,7 +481,19 @@ export class CartModel {
       const existingUserCart = await tx.cart.findFirst({
         where: { userId },
         include: {
-          items: true,
+          items: {
+            include: {
+              product: {
+                include: {
+                  images: {
+                    where: { isPrimary: true },
+                    take: 1,
+                  },
+                },
+              },
+              service: true,
+            },
+          },
         },
       });
 
@@ -442,6 +520,7 @@ export class CartModel {
                     },
                   },
                 },
+                service: true,
               },
               orderBy: { addedAt: 'desc' },
             },
@@ -462,21 +541,26 @@ export class CartModel {
       include: {
         items: {
           include: {
-            product: true,
+            items: {
+              include: {
+                product: true,
+                service: true,
+              },
+            },
+            orderBy: { addedAt: 'desc' },
           },
         },
-      },
-    });
+      });
 
     if (!cart) {
       throw new Error('CART_NOT_FOUND');
     }
 
     const itemCount = cart.items.reduce((sum, item) => sum + item.quantity, 0);
-    const subtotal = cart.items.reduce(
-      (sum, item) => sum + (Number(item.product.price) * item.quantity),
-      0
-    );
+    const subtotal = cart.items.reduce((sum, item) => {
+      const price = item.productId ? Number(item.product?.price) : (item.serviceId ? Number(item.service?.basePrice) : 0);
+      return sum + (price * item.quantity);
+    }, 0);
 
     return {
       itemCount,
@@ -527,28 +611,45 @@ export class CartModel {
   }
 
   private static async updateCartTotals(cart: CartWithItems): Promise<CartWithItems> {
-    const subtotal = cart.items.reduce(
-      (sum, item) => sum + (Number(item.product.price) * item.quantity),
-      0
-    );
+    const subtotal = cart.items.reduce((sum, item) => {
+      const price = item.productId ? Number(item.product?.price) : (item.serviceId ? Number(item.service?.basePrice) : 0);
+      return sum + (price * item.quantity);
+    }, 0);
 
-    await prisma.cart.update({
+    const updatedCart = await prisma.cart.update({
       where: { id: cart.id },
       data: { subtotal },
+      include: {
+        items: {
+          include: {
+            product: {
+              include: {
+                images: {
+                  where: { isPrimary: true },
+                  take: 1,
+                },
+              },
+            },
+            service: true,
+          },
+          orderBy: { addedAt: 'desc' },
+        },
+      },
     });
 
-    return {
-      ...cart,
-      subtotal,
-    };
+    return updatedCart;
   }
 
-  private static calculateShipping(items: any[]): number {
+  private static calculateShipping(items: (CartItem & { product: Product | null; service: Service | null; })[]): number {
     // Simple shipping calculation - would be more complex in real app
     const totalWeight = items.reduce((sum, item) => {
-      // Assume weight based on category
-      const weight = item.product.category === 'CARS' ? 2000 : 5; // kg
-      return sum + (weight * item.quantity);
+      if (item.product) {
+        // Assume weight based on category
+        const weight = item.product.category === 'CARS' ? 2000 : 5; // kg
+        return sum + (weight * item.quantity);
+      }
+      // Services don't have weight for shipping calculation
+      return sum;
     }, 0);
 
     if (totalWeight > 1000) return 0; // Free shipping for heavy items (cars)
@@ -568,11 +669,18 @@ export class CartModel {
       include: {
         items: {
           include: {
-            product: true,
+            product: {
+              include: {
+                images: {
+                  where: { isPrimary: true },
+                  take: 1,
+                },
+              },
+            },
+            service: true,
           },
         },
-      },
-    });
+      });
 
     if (!cart) {
       return { valid: false, errors: ['CART_NOT_FOUND'] };
@@ -584,18 +692,28 @@ export class CartModel {
       errors.push('CART_EMPTY');
     }
 
-    // Check stock for all items
+    // Check stock/availability for all items
     for (const item of cart.items) {
-      const hasStock = await ProductModel.checkStock(
-        item.productId,
-        item.quantity
-      );
-      if (!hasStock) {
-        errors.push(`INSUFFICIENT_STOCK_${item.product.name}`);
-      }
+      if (item.productId && item.product) {
+        const hasStock = await ProductModel.checkStock(
+          item.productId,
+          item.quantity
+        );
+        if (!hasStock) {
+          errors.push(`INSUFFICIENT_STOCK_${item.product.name}`);
+        }
 
-      if (item.product.status !== 'ACTIVE') {
-        errors.push(`PRODUCT_NOT_AVAILABLE_${item.product.name}`);
+        if (item.product.status !== 'ACTIVE') {
+          errors.push(`PRODUCT_NOT_AVAILABLE_${item.product.name}`);
+        }
+      } else if (item.serviceId && item.service) {
+        // For services, check if it's active. More complex availability checks
+        // would be done at the time of actual booking confirmation.
+        if (item.service.status !== 'ACTIVE') {
+          errors.push(`SERVICE_NOT_AVAILABLE_${item.service.name}`);
+        }
+      } else {
+        errors.push('UNKNOWN_ITEM_IN_CART');
       }
     }
 
